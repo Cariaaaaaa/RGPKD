@@ -26,6 +26,11 @@ Experiments on MVTec AD and MVTec 3D-AD datasets demonstrate that RGPKD achieves
 
 ## Usage
 
+## Create a virtual environment (optional)
+
+conda create -n anomaly-detection python=3.7
+conda activate anomaly-detection
+
 ## Prerequisites
 
 - [Python 3.5](https://www.python.org/)
@@ -35,7 +40,10 @@ Experiments on MVTec AD and MVTec 3D-AD datasets demonstrate that RGPKD achieves
 - [adversarial-robustness-toolbox](https://github.com/Trusted-AI/adversarial-robustness-toolbox)
 
 ## Clone repository
-
+pip install torch==1.8.0+cu111 torchvision==0.9.0+cu111 -f https://download.pytorch.org/whl/torch_stable.html
+pip install numpy==1.21.6 scipy==1.7.3 matplotlib==3.5.3 scikit-image==0.19.3
+pip install pillow==9.1.1 tqdm==4.64.1 pandas==1.3.5 opencv-python==4.6.0.66
+pip install scikit-learn==1.0.2
 ```shell
 git clone https://github.com/Cariaaaaaa/RGPKD.git
 ```
@@ -54,7 +62,6 @@ Download the following datasets and unzip them into `data` folder
 ## Training
 
 ```shell
-    cd src/
     python3 train.py
 ```
 
