@@ -1,646 +1,561 @@
-import torch
-import torch.nn as nn  # 添加这行代码
-from dataset import get_data_transforms, load_data
-from torchvision.datasets import ImageFolder
-import numpy as np
-from torch.utils.data import DataLoader
-from resnet import resnet18, resnet34, resnet50, wide_resnet50_2
-from de_resnet import de_resnet18, de_resnet50, de_wide_resnet50_2
-from dataset import MVTecDataset, MVTecDataset_test
-from torch.nn import functional as F
-from sklearn.metrics import roc_auc_score
-import cv2
-import matplotlib.pyplot as plt
-from sklearn.metrics import auc
-from skimage import measure
-import pandas as pd
-from numpy import ndarray
-from statistics import mean
-from scipy.ndimage import gaussian_filter
-from sklearn import manifold
-from matplotlib.ticker import NullFormatter
-from scipy.spatial.distance import pdist
-import matplotlib
-import pickle
-import csv
-
-
-# 定义辅助分类器
-class AuxiliaryClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super(AuxiliaryClassifier, self).__init__()
-        self.fc = nn.Linear(input_dim, num_classes)
-
-    def forward(self, x):
-        return self.fc(x)
-
-
-# def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
-#
-#     min_len = min(len(fs_list), len(ft_list))
-#     fs_list = fs_list[:min_len]
-#     ft_list = ft_list[:min_len]
-#
-#     if amap_mode == 'mul':
-#         anomaly_map = np.ones([out_size, out_size])
-#     else:
-#         anomaly_map = np.zeros([out_size, out_size])
-#
-#     a_map_list = []
-#     for i in range(len(ft_list)):
-#         fs = fs_list[i]
-#         ft = ft_list[i]
-#
-#     #     a_map = 1 - F.cosine_similarity(fs, ft)
-#     #     a_map = torch.unsqueeze(a_map, dim=1)
-#     #     a_map = F.interpolate(a_map, size=out_size, mode='bilinear', align_corners=True)
-#     #     a_map = a_map[0, 0, :, :].to('cpu').detach().numpy()
-#     #     a_map_list.append(a_map)
-#     #     if amap_mode == 'mul':
-#     #         anomaly_map *= a_map
-#     #     else:
-#     #         anomaly_map += a_map
-#     #
-#     # return anomaly_map, a_map_list
-#     # 使用多尺度特征差异
-#     diff = (fs - ft) ** 2  # 计算平方差
-#     diff = torch.mean(diff, dim=1, keepdim=True)  # 沿通道维度平均
-#
-#     # 多尺度融合
-#     a_map = F.interpolate(diff, size=out_size, mode='bilinear', align_corners=True)
-#     a_map = a_map[0, 0, :, :].cpu().numpy()
-#
-#     # 归一化
-#     a_map = (a_map - a_map.min()) / (a_map.max() - a_map.min() + 1e-8)
-#
-#     if amap_mode == 'mul':
-#         anomaly_map *= a_map
-#     else:
-#             anomaly_map += a_map
-#
-#     # 后处理
-#     if amap_mode == 'mul':
-#         anomaly_map = np.power(anomaly_map, 1 / min_len)  # 几何平均
-#     else:
-#         anomaly_map /= min_len  # 算术平均
-#
-#     return anomaly_map, []
-def cal_anomaly_map(fs_list, ft_list, out_size=224, amap_mode='mul'):
-    anomaly_map = np.zeros([out_size, out_size])
-
-    for fs, ft in zip(fs_list, ft_list):
-        # 多尺度特征差异
-        diff = torch.abs(fs - ft)
-
-        # 通道注意力权重
-        channel_weights = torch.mean(diff, dim=[2, 3], keepdim=True)
-        weighted_diff = diff * channel_weights
-
-        # 空间注意力
-        spatial_weights = torch.mean(weighted_diff, dim=1, keepdim=True)
-
-        # 插值到输出尺寸
-        a_map = F.interpolate(spatial_weights, size=out_size, mode='bilinear', align_corners=True)
-        a_map = a_map.squeeze().cpu().numpy()
-
-        # 归一化
-        a_map = (a_map - a_map.min()) / (a_map.max() - a_map.min() + 1e-8)
-
-        # 融合方式
-        if amap_mode == 'mul':
-            anomaly_map = np.maximum(anomaly_map, a_map)  # 取最大值而不是相乘
-        else:
-            anomaly_map += a_map
-
-    if amap_mode != 'mul':
-        anomaly_map /= len(fs_list)
-
-    return anomaly_map, []
-
-def show_cam_on_image(img, anomaly_map):
-    cam = np.float32(anomaly_map) / 255 + np.float32(img) / 255
-    cam = cam / np.max(cam)
-    return np.uint8(255 * cam)
-
-
-def min_max_norm(image):
-    a_min = np.nanmin(image)
-    a_max = np.nanmax(image)
-    if a_max == a_min:
-        return np.zeros_like(image, dtype=np.float32)
-    normalized = (image - a_min) / (a_max - a_min)
-    normalized = np.clip(normalized, 0, 1)
-    return normalized
-
-
-def cvt2heatmap(gray):
-    heatmap = cv2.applyColorMap(np.uint8(gray), cv2.COLORMAP_JET)
-    return heatmap
-
-
-def evaluation(encoder, bn, decoder, decoder2, dataloader, device):
-    print('Evaluating...')
-    # if len(dataloader) == 0:
-    #     raise ValueError("测试数据集中没有样本，请检查数据集路径和内容")
-    bn.eval()
-    decoder.eval()
-    decoder2.eval()
-    # if auxiliary_classifier:
-    #     auxiliary_classifier.eval()
-
-    gt_list_px = []
-    pr_list_px = []
-    gt_list_sp = []
-    pr_list_sp = []
-    aupro_list = []
-    correct_test = 0
-    total_test = 0
-
-    with torch.no_grad():
-        for img, gt, labels, types in dataloader:
-            # # img classifer result
-            # print('This img is a '+ str(types[0][0]) + ' ' +str(types[1][0])) # return tuble
-
-
-
-            img = img.to(device)
-            gt = gt.to(device)
-            labels[0] = labels[0].to(device)
-            labels[1] = labels[1].to(device)
-
-            inputs = encoder(img)
-            apha = 0.9
-            beta = 1-apha
-            outputs = [output * apha for output in decoder(bn(inputs))]
-            outputs2 = [output2 * beta for output2 in decoder2(img)]
-            output_sum = outputs2 +outputs
-            # output_sum_e =[tensor1 /2.0 for tensor1 in output_sum]
-            # print(f"Inputs 类型: {type(inputs)}, 长度: {len(inputs) if isinstance(inputs, list) else 'N/A'}")
-            # print(
-            #     f"Output_sum 类型: {type(output_sum)}, 长度: {len(output_sum) if isinstance(output_sum, list) else 'N/A'}")
-            # for i, inp in enumerate(inputs):
-            #     print(f"Input {i} 形状: {inp.shape}")
-            # for i, out in enumerate(output_sum):
-            #     print(f"Output {i} 形状: {out.shape}")
-
-            anomaly_map, _ = cal_anomaly_map(inputs, output_sum, img.shape[-1], amap_mode='a')
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-            gt[gt > 0.5] = 1
-            gt[gt <= 0.5] = 0
-
-            if labels[0].item() != 0:
-                aupro_list.append(compute_pro(gt.squeeze(0).cpu().numpy().astype(int),
-                                              anomaly_map[np.newaxis, :, :]))
-
-            gt_list_px.extend(gt.cpu().numpy().astype(int).ravel())
-            pr_list_px.extend(anomaly_map.ravel())
-            gt_list_sp.append(np.max(gt.cpu().numpy().astype(int)))
-            pr_list_sp.append(np.max(anomaly_map))
-
-            # 计算辅助分类器的分类准确率
-            # if auxiliary_classifier:
-            #     auxiliary_output = auxiliary_classifier(outputs)
-            #     value_p, predicted = torch.max(auxiliary_output.data, 1)
-            #     total_test += labels[1].size(0)
-            #     correct_test += (predicted == labels[1]).sum().item()  # count the right classification number
-
-        auroc_px = round(roc_auc_score(gt_list_px, pr_list_px), 3)
-        auroc_sp = round(roc_auc_score(gt_list_sp, pr_list_sp), 3)
-        aupro_px = round(np.mean(aupro_list), 3)
-
-        # 计算辅助分类器的分类准确率
-        # if auxiliary_classifier:
-        #     test_accuracy = 100 * correct_test / total_test
-        #     print(f'Auxiliary Classifier Test Accuracy: {test_accuracy:.4f}%')
-
-    # return auroc_px, auroc_sp, aupro_px, test_accuracy
-    return auroc_px, auroc_sp, aupro_px
-
-
-def evaluation_test(encoder, bn, decoder, dataloader, device, _class_=None):
-    bn.eval()
-    decoder.eval()
-    # if auxiliary_classifier:
-    #     auxiliary_classifier.eval()
-
-    gt_list_px = []
-    pr_list_px = []
-    gt_list_sp = []
-    pr_list_sp = []
-    aupro_list = []
-    correct_test = 0
-    total_test = 0
-
-    with torch.no_grad():
-        for img, gt, label, _ in dataloader:
-            img = img.to(device)
-            inputs = encoder(img)
-            outputs = decoder(bn(inputs))
-            anomaly_map, _ = cal_anomaly_map(inputs, outputs, img.shape[-1], amap_mode='a')
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-            gt[gt > 0.5] = 1
-            gt[gt <= 0.5] = 0
-
-            if label.item() != 0:
-                aupro_list.append(compute_pro(gt.squeeze(0).cpu().numpy().astype(int),
-                                              anomaly_map[np.newaxis, :, :]))
-
-            gt_list_px.extend(gt.cpu().numpy().astype(int).ravel())
-            pr_list_px.extend(anomaly_map.ravel())
-            gt_list_sp.append(np.max(gt.cpu().numpy().astype(int)))
-            pr_list_sp.append(np.max(anomaly_map))
-
-            # 计算辅助分类器的分类准确率
-            # if auxiliary_classifier:
-            #     auxiliary_output = auxiliary_classifier(inputs[-1].view(inputs[-1].shape[0], -1))
-            #     _, predicted = torch.max(auxiliary_output.data, 1)
-            #     total_test += label.size(0)
-            #     correct_test += (predicted == label).sum().item()
-
-        auroc_px = round(roc_auc_score(gt_list_px, pr_list_px), 3)
-        auroc_sp = round(roc_auc_score(gt_list_sp, pr_list_sp), 3)
-        aupro_px = round(np.mean(aupro_list), 3)
-
-    return auroc_px, auroc_sp, aupro_px
-
-
-def test(test_class):
-    # test_class = 'bottle'
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(device)
-    print(test_class)
-    data_transform, gt_transform = get_data_transforms(256, 256)
-    dataset_path_root = './dataset/test/' + test_class + '/'
-    ckp_path = './checkpoints/' + 'Best' + '.pth'
-    # test_data = MVTecDataset(root=test_path, transform=data_transform, gt_transform=gt_transform, phase="test")
-    # 修改测试数据加载部分
-    test_data = MVTecDataset_test(
-        root=dataset_path_root,  # 确保路径正确
-        transform=data_transform,
-        gt_transform=gt_transform,
-        phase="test"
-    )
-    print(f"测试样本数量: {len(test_data)}")  # 检查数据量
-    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False)
-
-    encoder, bn = wide_resnet50_2(pretrained=True)
-    encoder = encoder.to(device)
-    bn = bn.to(device)
-    encoder.eval()
-    decoder = de_wide_resnet50_2(pretrained=False)
-    decoder = decoder.to(device)
-
-    # 加载辅助分类器
-    # num_classes = len(test_data.classes)
-    # train_dataloader, test_dataloader = load_data(dataset_name='mvtec')
-    # num_classes = len(test_dataloader.dataset.classes)  # 获取类别数量
-    # print("Number of classes:", num_classes)
-    # auxiliary_classifier = AuxiliaryClassifier(input_dim=2048, num_classes=num_classes).to(device)
-    ckp = torch.load(ckp_path)
-    decoder.load_state_dict(ckp['decoder'])
-    bn.load_state_dict(ckp['bn'])
-    # if 'auxiliary_classifier' in ckp:
-    #     auxiliary_classifier.load_state_dict(ckp['auxiliary_classifier'])
-
-    auroc_px, auroc_sp, aupro_px = evaluation_test(encoder, bn, decoder, test_dataloader, device, test_class, )
-    print("Class: {}, Pixel Auroc: {:.4f}, Sample Auroc： {:.4f}, Pixel Aupro： {:.4f}".format(
-        test_class, auroc_px, auroc_sp, aupro_px))
-    with open('./save_csv/Result_test.csv', 'a', newline='') as f1:
-        writer = csv.writer(f1)
-        row = [
-            "Class: {}, Pixel Auroc: {:.4f}, Sample Auroc： {:.4f}, Pixel Aupro： {:.4f}".format(
-                test_class, auroc_px, auroc_sp, aupro_px)]
-        writer.writerow(row)
-    return auroc_px
-
+"""
+基于重建指导和提示模块的知识蒸馏方法（RGPKD）
+"""
 
 import os
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms, models
+from sklearn.metrics import roc_auc_score
+from scipy.ndimage import gaussian_filter
 
+# 全局配置
+DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+IMAGE_SIZE = 256
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+EPOCHS = 800  # RGPKD训练轮次
 
-def visualization(_class_):
-    print(_class_)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(device)
-    image_size = 256
-    data_transform, gt_transform = get_data_transforms(image_size, image_size)
-    dataset_path_root = './dataset/test/' + _class_ + '/'
-    ckp_path = './checkpoints/' + 'Best' + '.pth'
-    test_data = MVTecDataset_test(root=dataset_path_root, transform=data_transform, gt_transform=gt_transform,
-                                  phase="test")
-    test_dataloader = torch.utils.data.DataLoader(test_data, batch_size=1, shuffle=False)
+class MVTecADDataset(Dataset):
+    """MVTec AD数据集加载类"""
+    def __init__(self, root_dir, category, train=True, transform=None):
+        self.root_dir = root_dir
+        self.category = category
+        self.train = train
+        self.transform = transform
+        self.image_paths = []
+        self.label_paths = []
+        
+        # 训练集（仅正常样本）
+        if train:
+            img_dir = os.path.join(root_dir, category, "train", "good")
+            for img_name in os.listdir(img_dir):
+                self.image_paths.append(os.path.join(img_dir, img_name))
+                self.label_paths.append(None)  # 训练集无标签
+        # 测试集（正常+异常样本）
+        else:
+            img_dir = os.path.join(root_dir, category, "test")
+            for sub_dir in os.listdir(img_dir):
+                sub_img_dir = os.path.join(img_dir, sub_dir)
+                if not os.path.isdir(sub_img_dir):
+                    continue
+                
+                # 异常标签路径
+                label_dir = os.path.join(root_dir, category, "ground_truth", sub_dir) if sub_dir != "good" else None
+                for img_name in os.listdir(sub_img_dir):
+                    self.image_paths.append(os.path.join(sub_img_dir, img_name))
+                    if sub_dir == "good":
+                        self.label_paths.append(None)
+                    else:
+                        label_name = img_name.replace(".png", "_mask.png")
+                        self.label_paths.append(os.path.join(label_dir, label_name))
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path).convert("RGB")
+        label = None
+        
+        if self.label_paths[idx] is not None and os.path.exists(self.label_paths[idx]):
+            label = Image.open(self.label_paths[idx]).convert("L")  # 灰度标签图
+        
+        if self.transform:
+            image = self.transform(image)
+            if label is not None:
+                label = transforms.ToTensor()(label).squeeze(0)  # 转为张量并去除通道维
+        
+        # 标签：0=正常，1=异常
+        img_label = 0 if self.label_paths[idx] is None else 1
+        return image, label, img_label, img_path
 
-    encoder, bn = wide_resnet50_2(pretrained=True)
-    encoder = encoder.to(device)
-    bn = bn.to(device)
+def get_mvtec_dataloader(root_dir, category, train=True, batch_size=BATCH_SIZE):
+    """获取数据集加载器"""
+    if train:
+        transform = transforms.Compose([
+            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        transform = transforms.Compose([
+            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    dataset = MVTecADDataset(root_dir, category, train, transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=4)
+    return dataloader
 
-    encoder.eval()
-    decoder = de_wide_resnet50_2(pretrained=False)
-    decoder = decoder.to(device)
-    ckp = torch.load(ckp_path)
-    # for k, v in list(ckp['bn'].items()):
-    #     if 'memory' in k:
-    #         ckp['bn'].pop(k)
-    decoder.load_state_dict(ckp['decoder'])
-    bn.load_state_dict(ckp['bn'])
-    idx = 1
-    count = 0
-    with torch.no_grad():
-        for img, gt, label, _ in test_dataloader:
-            if (label.item() == 0):
+def calculate_metrics(pred_scores, gt_labels, pred_masks=None, gt_masks=None):
+    """计算评价指标：I-AUROC、P-AUROC、PRO"""
+    # 图像级AUROC（I-AUROC）
+    img_scores = [score.max() for score in pred_scores]  # 每张图的最大异常得分
+    i_auroc = roc_auc_score(gt_labels, img_scores)
+    
+    # 像素级AUROC（P-AUROC）和PRO
+    p_auroc = 0.0
+    pro = 0.0
+    
+    if pred_masks is not None and gt_masks is not None:
+        all_pred_pixels = []
+        all_gt_pixels = []
+        overlap_sum = 0.0
+        count = 0
+        
+        for pred_mask, gt_mask in zip(pred_masks, gt_masks):
+            if gt_mask is None:  # 正常样本，跳过像素级评估
                 continue
-            # if count <= 10:
-            #    count += 1
-            #    continue
-
-            decoder.eval()
-            bn.eval()
-
-            img = img.to(device)
-            gt = gt.to(device)
-            inputs = encoder(img)
-            outputs = decoder(bn(inputs))
-
-            # inputs.append(feature)
-            # inputs.append(outputs)
-            # t_sne(inputs)
-
-            anomaly_map, amap_list = cal_anomaly_map([inputs[-1]], [outputs[-1]], img.shape[-1], amap_mode='a')
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-
-            ano_map = min_max_norm(anomaly_map)
-            ano_map = cvt2heatmap(ano_map * 255)
-
-            anomaly_map[anomaly_map > 0.24] = 1  ##ROI阈值
-            anomaly_map[anomaly_map <= 0.24] = 0
-            anomaly_map = torch.Tensor(anomaly_map)
-            anomaly_map = torch.unsqueeze(anomaly_map, 0)
-            anomaly_map = torch.unsqueeze(anomaly_map, 0)
-            anomaly_map = anomaly_map.to(device)
-            img = cv2.cvtColor(img.permute(0, 2, 3, 1).cpu().numpy()[0] * 255, cv2.COLOR_BGR2RGB)
-            img = np.uint8(min_max_norm(img) * 255)
-            gt1 = gt.permute(0, 2, 3, 1).cpu()
-            gt = cv2.cvtColor(gt1.numpy()[0] * 255, cv2.COLOR_BGR2RGB)
-            gt = np.uint8(min_max_norm(gt) * 255)
-            anomaly_map1 = anomaly_map.permute(0, 2, 3, 1).cpu()
-            anomaly_map = cv2.cvtColor(anomaly_map1.numpy()[0] * 255, cv2.COLOR_BGR2RGB)
-            anomaly_map = np.uint8(min_max_norm(anomaly_map) * 255)
-            # if not os.path.exists('./results_all/'+_class_):
-            #    os.makedirs('./results_all/'+_class_)
-            # cv2.imwrite('./results_all/'+_class_+'/'+str(count)+'_'+'org.png',img)
-            # plt.imshow(img)
-            # plt.axis('off')
-            # plt.savefig('org.png')
-            # plt.show()
-            ano_map = show_cam_on_image(img, ano_map)
-
-            # cv2.imwrite('./results_all/'+_class_+'/'+str(count)+'_'+'ad.png', ano_map)
-            save_file_name = 'Visualization_result'
-            save_img_path = './' + save_file_name
-            if not os.path.exists(save_img_path):
-                os.makedirs(save_img_path)
-            plt.subplot(2, 2, 1)
-            plt.imshow(ano_map)
-            plt.title('ano_map', y=-0.3)
-            plt.subplot(2, 2, 2)
-            # plt.axis('off')
-            # plt.savefig(f'./save3_AANEWNEW/ad{idx}.png')
-            plt.imshow(img)
-            # plt.axis('off')
-            # plt.savefig(f'./save3_AANEWNEW/ad{idx}or.png')
-            plt.title('or_img', y=-0.3)
-            plt.subplot(2, 2, 4)
-            plt.imshow(gt)
-            plt.title('ground_truth', y=-0.3)
-            plt.subplot(2, 2, 3)
-            plt.imshow(anomaly_map)
-            plt.title('ROI', y=-0.3)
-            plt.savefig('./Visualization_result/' + _class_ + f'{idx}.png')
-            print(_class_ + str(idx) + '  saved')
-            idx += 1
-            # plt.show()
-
-            # gt = gt.cpu().numpy().astype(int)[0][0]*255
-            # cv2.imwrite('./results/'+_class_+'_'+str(count)+'_'+'gt.png', gt)
-
-            # b, c, h, w = inputs[2].shape
-            # t_feat = F.normalize(inputs[2], p=2).view(c, -1).permute(1, 0).cpu().numpy()
-            # s_feat = F.normalize(outputs[2], p=2).view(c, -1).permute(1, 0).cpu().numpy()
-            # c = 1-min_max_norm(cv2.resize(anomaly_map,(h,w))).flatten()
-            # print(c.shape)
-            # t_sne([t_feat, s_feat], c)
-            # assert 1 == 2
-
-            # name = 0
-            # for anomaly_map in amap_list:
-            #    anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-            #    ano_map = min_max_norm(anomaly_map)
-            #    ano_map = cvt2heatmap(ano_map * 255)
-            # ano_map = show_cam_on_image(img, ano_map)
-            # cv2.imwrite(str(name) + '.png', ano_map)
-            # plt.imshow(ano_map)
-            # plt.axis('off')
-            # plt.savefig(str(name) + '.png')
-            # plt.show()
-            #    name+=1
+            
+            # 归一化到0-1
+            pred_mask = (pred_mask - pred_mask.min()) / (pred_mask.max() - pred_mask.min() + 1e-8)
+            gt_mask = (gt_mask > 0).float()  # 二值化标签
+            
+            # 像素级AUROC
+            all_pred_pixels.extend(pred_mask.flatten().cpu().numpy())
+            all_gt_pixels.extend(gt_mask.flatten().cpu().numpy())
+            
+            # PRO计算（预测与真实异常区域重叠率）
+            intersection = (pred_mask > 0.5).float() * gt_mask
+            union = (pred_mask > 0.5).float() + gt_mask - intersection
+            overlap = (intersection.sum() / (union.sum() + 1e-8)).item()
+            overlap_sum += overlap
             count += 1
-            # if count>20:
-            #    return 0
-            # assert 1==2
+        
+        if len(all_pred_pixels) > 0:
+            p_auroc = roc_auc_score(all_gt_pixels, all_pred_pixels)
+        if count > 0:
+            pro = overlap_sum / count
+    
+    return i_auroc, p_auroc, pro
 
+def visualize_result(image, gt_mask, pred_mask, save_path=None):
+    """可视化异常检测结果：原图、真实标签、预测热力图"""
+    # 反归一化图像
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1).to(DEVICE)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1).to(DEVICE)
+    image = image * std + mean
+    image = image.permute(1, 2, 0).cpu().detach().numpy()
+    image = (image * 255).astype(np.uint8)
+    
+    # 处理预测掩码
+    pred_mask = (pred_mask - pred_mask.min()) / (pred_mask.max() - pred_mask.min() + 1e-8)
+    pred_mask = pred_mask.cpu().detach().numpy()
+    pred_heatmap = cv2.applyColorMap((pred_mask * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    pred_heatmap = cv2.cvtColor(pred_heatmap, cv2.COLOR_BGR2RGB)
+    overlay = cv2.addWeighted(image, 0.6, pred_heatmap, 0.4, 0)
+    
+    # 处理真实掩码
+    gt_vis = image.copy()
+    if gt_mask is not None:
+        gt_mask = (gt_mask > 0).cpu().numpy()
+        gt_vis[gt_mask] = [255, 0, 0]  # 红色标记真实异常区域
+    
+    # 绘图
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    axes[0].imshow(image)
+    axes[0].set_title("Original Image")
+    axes[0].axis("off")
+    
+    axes[1].imshow(gt_vis)
+    axes[1].set_title("Ground Truth Anomaly")
+    axes[1].axis("off")
+    
+    axes[2].imshow(overlay)
+    axes[2].set_title("Predicted Anomaly Heatmap")
+    axes[2].axis("off")
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight", dpi=300)
+        plt.close()
 
-def vis_nd(name, _class_):
-    print(name, ':', _class_)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(device)
+class SSIMLoss(nn.Module):
+    """结构相似度损失函数"""
+    def __init__(self, window_size=11, size_average=True):
+        super(SSIMLoss, self).__init__()
+        self.window_size = window_size
+        self.size_average = size_average
+        self.channel = 1
+        self.window = self._create_window(window_size, self.channel)
+    
+    def _create_window(self, window_size, channel):
+        window = torch.ones(window_size, window_size) / (window_size * window_size)
+        window = window.unsqueeze(0).unsqueeze(0).repeat(channel, 1, 1, 1)
+        return window.to(DEVICE)
+    
+    def forward(self, img1, img2):
+        mu1 = F.conv2d(img1, self.window, padding=self.window_size//2, groups=self.channel)
+        mu2 = F.conv2d(img2, self.window, padding=self.window_size//2, groups=self.channel)
+        mu1_sq = mu1.pow(2)
+        mu2_sq = mu2.pow(2)
+        mu1_mu2 = mu1 * mu2
+        
+        sigma1_sq = F.conv2d(img1*img1, self.window, padding=self.window_size//2, groups=self.channel) - mu1_sq
+        sigma2_sq = F.conv2d(img2*img2, self.window, padding=self.window_size//2, groups=self.channel) - mu2_sq
+        sigma12 = F.conv2d(img1*img2, self.window, padding=self.window_size//2, groups=self.channel) - mu1_mu2
+        
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        
+        if self.size_average:
+            return 1 - ssim_map.mean()
+        else:
+            return 1 - ssim_map.mean(1).mean(1).mean(1)
 
-    ckp_path = './checkpoints/' + name + '_' + str(_class_) + '.pth'
-    train_dataloader, test_dataloader = load_data(name, _class_, batch_size=16)
+class PromptModule(nn.Module):
+    """提示模块：多尺度特征匹配与融合"""
+    def __init__(self, in_channels=512, mid_channels=256):
+        super(PromptModule, self).__init__()
+        self.theta = nn.Conv2d(in_channels, mid_channels, kernel_size=1, padding=0)
+        self.phi = nn.Conv2d(in_channels, mid_channels, kernel_size=1, padding=0)
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(mid_channels*3, mid_channels, kernel_size=1, padding=0),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x, prompt_feature):
+        """
+        x: 输入特征 (B, C, H, W)
+        prompt_feature: 提示库特征 (B, C, H_p, W_p)
+        """
+        # 特征投影
+        theta_x = self.theta(x)  # (B, mid_C, H, W)
+        phi_p = self.phi(prompt_feature)  # (B, mid_C, H_p, W_p)
+        
+        # 双向亲和度计算
+        B, C, H, W = theta_x.shape
+        _, _, Hp, Wp = phi_p.shape
+        
+        theta_x_flat = theta_x.view(B, C, -1).permute(0, 2, 1)  # (B, H*W, C)
+        phi_p_flat = phi_p.view(B, C, -1)  # (B, C, Hp*Wp)
+        
+        aff_x2p = torch.bmm(theta_x_flat, phi_p_flat)  # (B, H*W, Hp*Wp)
+        aff_p2x = torch.bmm(phi_p_flat.permute(0, 2, 1), theta_x_flat.permute(0, 2, 1).transpose(1,2))  # (B, Hp*Wp, H*W)
+        
+        # 关系特征构建
+        aff_x2p = aff_x2p.view(B, 1, H, W, Hp*Wp).permute(0, 4, 2, 3, 1).view(B, Hp*Wp, H, W)
+        aff_p2x = aff_p2x.view(B, 1, Hp, Wp, H*W).permute(0, 4, 2, 3, 1).view(B, H*W, Hp, Wp)
+        aff_p2x = F.interpolate(aff_p2x, size=(H, W), mode='bilinear', align_corners=False)
+        
+        # 特征融合
+        relation_feature = torch.cat([theta_x, 
+                                     aff_x2p.mean(dim=1, keepdim=True).repeat(1, C//2, 1, 1),
+                                     aff_p2x.mean(dim=1, keepdim=True).repeat(1, C//2, 1, 1)], dim=1)
+        fused_feature = self.fusion_conv(relation_feature)
+        return fused_feature
 
-    encoder, bn = resnet18(pretrained=True)
-    encoder = encoder.to(device)
-    bn = bn.to(device)
-    encoder.eval()
-    decoder = de_resnet18(pretrained=False)
-    decoder = decoder.to(device)
+class UNetWithPrompt(nn.Module):
+    """带提示模块的Unet学生网络"""
+    def __init__(self, in_channels=3, out_channels=3, prompt_channels=256):
+        super(UNetWithPrompt, self).__init__()
+        
+        # 编码器（ResNet18基础结构）
+        resnet = models.resnet18(pretrained=True)
+        self.encoder1 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)  # (B, 64, 128, 128)
+        self.encoder2 = nn.Sequential(resnet.maxpool, resnet.layer1)  # (B, 64, 64, 64)
+        self.encoder3 = resnet.layer2  # (B, 128, 32, 32)
+        self.encoder4 = resnet.layer3  # (B, 256, 16, 16)
+        self.encoder5 = resnet.layer4  # (B, 512, 8, 8)
+        
+        # 提示模块
+        self.prompt_module1 = PromptModule(in_channels=512, mid_channels=256)
+        self.prompt_module2 = PromptModule(in_channels=256, mid_channels=128)
+        self.prompt_module3 = PromptModule(in_channels=128, mid_channels=64)
+        
+        # 解码器
+        self.decoder1 = nn.Sequential(
+            nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )  # (B, 256, 16, 16)
+        
+        self.decoder2 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True)
+        )  # (B, 128, 32, 32)
+        
+        self.decoder3 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )  # (B, 64, 64, 64)
+        
+        self.decoder4 = nn.Sequential(
+            nn.ConvTranspose2d(64, 3, kernel_size=2, stride=2),
+            nn.Sigmoid()
+        )  # (B, 3, 128, 128)
+        
+        self.final_up = nn.Upsample(size=(IMAGE_SIZE, IMAGE_SIZE), mode='bilinear', align_corners=False)
+        
+        # 卷积融合层
+        self.conv_fuse1 = nn.Conv2d(256+256, 256, kernel_size=3, padding=1)
+        self.conv_fuse2 = nn.Conv2d(128+128, 128, kernel_size=3, padding=1)
+        self.conv_fuse3 = nn.Conv2d(64+64, 64, kernel_size=3, padding=1)
+    
+    def forward(self, x, prompt_features=None):
+        """
+        x: 输入图像 (B, 3, 256, 256)
+        prompt_features: 提示库特征 (B, 3, C, H, W) -> [F1, F2, F3]
+        """
+        # 编码过程
+        e1 = self.encoder1(x)  # (B, 64, 128, 128)
+        e2 = self.encoder2(e1)  # (B, 64, 64, 64)
+        e3 = self.encoder3(e2)  # (B, 128, 32, 32)
+        e4 = self.encoder4(e3)  # (B, 256, 16, 16)
+        e5 = self.encoder5(e4)  # (B, 512, 8, 8)
+        
+        # 解码+提示模块融合
+        d1 = self.decoder1(e5)  # (B, 256, 16, 16)
+        if prompt_features is not None:
+            d1 = self.prompt_module1(d1, prompt_features[2])  # F3对应16x16尺度
+        d1 = torch.cat([d1, e4], dim=1)
+        d1 = self.conv_fuse1(d1)  # (B, 256, 16, 16)
+        
+        d2 = self.decoder2(d1)  # (B, 128, 32, 32)
+        if prompt_features is not None:
+            d2 = self.prompt_module2(d2, prompt_features[1])  # F2对应32x32尺度
+        d2 = torch.cat([d2, e3], dim=1)
+        d2 = self.conv_fuse2(d2)  # (B, 128, 32, 32)
+        
+        d3 = self.decoder3(d2)  # (B, 64, 64, 64)
+        if prompt_features is not None:
+            d3 = self.prompt_module3(d3, prompt_features[0])  # F1对应64x64尺度
+        d3 = torch.cat([d3, e2], dim=1)
+        d3 = self.conv_fuse3(d3)  # (B, 64, 64, 64)
+        
+        d4 = self.decoder4(d3)  # (B, 3, 128, 128)
+        rec_img = self.final_up(d4)  # (B, 3, 256, 256)
+        
+        # 返回多尺度解码器特征和重建图
+        return [d3, d2, d1], rec_img
 
-    ckp = torch.load(ckp_path)
+class RGPKDModel(nn.Module):
+    """RGPKD整体模型：教师网络+学生网络"""
+    def __init__(self):
+        super(RGPKDModel, self).__init__()
+        
+        # 教师网络（预训练ResNet18，固定参数）
+        self.teacher = models.resnet18(pretrained=True)
+        for param in self.teacher.parameters():
+            param.requires_grad = False
+        
+        # 学生网络（带提示模块的Unet）
+        self.student = UNetWithPrompt()
+        
+        # 提示库（训练过程中构建）
+        self.prompt_lib = None
+    
+    def extract_teacher_features(self, x):
+        """提取教师网络多尺度特征"""
+        features = []
+        
+        x = self.teacher.conv1(x)
+        x = self.teacher.bn1(x)
+        x = self.teacher.relu(x)
+        x = self.teacher.maxpool(x)
+        
+        x = self.teacher.layer1(x)  # F1: (B, 64, 64, 64)
+        features.append(x)
+        
+        x = self.teacher.layer2(x)  # F2: (B, 128, 32, 32)
+        features.append(x)
+        
+        x = self.teacher.layer3(x)  # F3: (B, 256, 16, 16)
+        features.append(x)
+        
+        return features  # [F1, F2, F3]
+    
+    def build_prompt_lib(self, dataloader):
+        """构建提示库：教师网络提取的正常样本特征"""
+        self.teacher.eval()
+        prompt_lib = []
+        
+        with torch.no_grad():
+            for imgs, _, _, _ in tqdm(dataloader, desc="Building Prompt Library"):
+                imgs = imgs.to(DEVICE)
+                feats = self.extract_teacher_features(imgs)
+                prompt_lib.append(feats)
+        
+        # 按尺度拼接，形成提示库 (N, 3, C, H, W)
+        prompt_lib = [torch.cat([feats[i] for feats in prompt_lib], dim=0) for i in range(3)]
+        self.prompt_lib = prompt_lib
+    
+    def get_nearest_prompt(self, query_feat):
+        """从提示库中查找最近邻特征（余弦相似度）"""
+        query_feat = query_feat.view(query_feat.shape[0], query_feat.shape[1], -1).permute(0, 2, 1)
+        prompt_feat = self.prompt_lib[2].view(self.prompt_lib[2].shape[0], self.prompt_lib[2].shape[1], -1).permute(0, 2, 1)
+        
+        similarities = []
+        for q in query_feat:
+            sim = torch.matmul(q, prompt_feat.permute(0, 2, 1)).mean(dim=1)
+            similarities.append(sim)
+        
+        similarities = torch.stack(similarities, dim=0)
+        nearest_idx = similarities.argmax(dim=1)
+        
+        # 返回最近邻的多尺度特征
+        nearest_feats = [self.prompt_lib[i][nearest_idx].to(DEVICE) for i in range(3)]
+        return nearest_feats
+    
+    def forward(self, x, train_mode=True):
+        """
+        train_mode: True-训练（使用提示库），False-推理（不使用提示库）
+        """
+        # 教师网络特征
+        teacher_feats = self.extract_teacher_features(x)  # [F1, F2, F3]
+        
+        # 学生网络前向传播
+        if train_mode and self.prompt_lib is not None:
+            # 以学生网络e4作为查询（对应教师F3尺度）
+            e4 = self.student.encoder4(self.student.encoder3(self.student.encoder2(self.student.encoder1(x))))
+            nearest_feats = self.get_nearest_prompt(e4)
+            student_feats, rec_img = self.student(x, nearest_feats)
+        else:
+            student_feats, rec_img = self.student(x)
+        
+        # 学生特征按尺度对应教师特征（反转顺序：学生[d3,d2,d1]对应教师[F1,F2,F3]）
+        student_feats = student_feats[::-1]
+        
+        return teacher_feats, student_feats, rec_img
 
-    decoder.load_state_dict(ckp['decoder'])
-    bn.load_state_dict(ckp['bn'])
-    decoder.eval()
-    bn.eval()
+def train_rgpkd(root_dir, category):
+    """训练RGPKD模型"""
+    # 数据加载
+    train_loader = get_mvtec_dataloader(root_dir, category, train=True)
+    test_loader = get_mvtec_dataloader(root_dir, category, train=False)
+    
+    # 模型初始化
+    model = RGPKDModel().to(DEVICE)
+    model.build_prompt_lib(train_loader)  # 构建提示库
+    
+    # 损失函数与优化器
+    mse_loss = nn.MSELoss()
+    ssim_loss = SSIMLoss()
+    optimizer = optim.SGD(model.student.parameters(), lr=LEARNING_RATE, momentum=0.9)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    
+    # 训练过程
+    best_i_auroc = 0.0
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0.0
+        
+        for imgs, _, _, _ in tqdm(train_loader, desc=f"RGPKD Epoch {epoch+1}/{EPOCHS}"):
+            imgs = imgs.to(DEVICE)
+            optimizer.zero_grad()
+            
+            # 前向传播
+            teacher_feats, student_feats, rec_img = model(imgs, train_mode=True)
+            
+            # 基础损失（教师-学生特征MSE）
+            loss_basic = 0.0
+            for t_feat, s_feat in zip(teacher_feats, student_feats):
+                loss_basic += mse_loss(s_feat, t_feat)
+            
+            # 重建损失（MSE + SSIM）
+            loss_rm = mse_loss(rec_img, imgs)
+            loss_rs = ssim_loss(rec_img, imgs)
+            loss_rec = loss_rm + loss_rs
+            
+            # 总损失（λ1=λ2=λ3=1）
+            loss = loss_basic + loss_rm + loss_rs
+            
+            # 反向传播与优化
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * imgs.size(0)
+        
+        avg_loss = total_loss / len(train_loader.dataset)
+        scheduler.step()
+        print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}")
+        
+        # 验证（每20轮验证一次）
+        if (epoch+1) % 20 == 0 or epoch == EPOCHS-1:
+            i_auroc, p_auroc, pro = validate_rgpkd(model, test_loader)
+            print(f"Validation - I-AUROC: {i_auroc:.4f}, P-AUROC: {p_auroc:.4f}, PRO: {pro:.4f}")
+            
+            # 保存最优模型
+            if i_auroc > best_i_auroc:
+                best_i_auroc = i_auroc
+                torch.save(model.state_dict(), f"rgpkd_{category}_best.pth")
+                print(f"Best model saved (I-AUROC: {best_i_auroc:.4f})")
+    
+    return model
 
-    gt_list_sp = []
-    prmax_list_sp = []
-    prmean_list_sp = []
-
-    count = 0
+def validate_rgpkd(model, test_loader):
+    """验证RGPKD模型"""
+    model.eval()
+    pred_scores = []
+    pred_masks = []
+    gt_labels = []
+    gt_masks = []
+    
     with torch.no_grad():
-        for img, label in test_dataloader:
-            if img.shape[1] == 1:
-                img = img.repeat(1, 3, 1, 1)
-            # if count <= 10:
-            #    count += 1
-            #    continue
-            img = img.to(device)
-            inputs = encoder(img)
-            # print(inputs[-1].shape)
-            outputs = decoder(bn(inputs))
+        for imgs, labels, img_labels, img_paths in tqdm(test_loader, desc="Validating RGPKD"):
+            imgs = imgs.to(DEVICE)
+            gt_labels.extend(img_labels.numpy())
+            gt_masks.extend([label.to(DEVICE) if label is not None else None for label in labels])
+            
+            # 前向传播
+            teacher_feats, student_feats, _ = model(imgs, train_mode=False)
+            
+            # 生成异常评分图
+            anomaly_maps = []
+            for t_feat, s_feat in zip(teacher_feats, student_feats):
+                # L2范数归一化
+                t_feat_norm = F.normalize(t_feat, p=2, dim=1)
+                s_feat_norm = F.normalize(s_feat, p=2, dim=1)
+                
+                # 计算特征差异
+                diff = torch.norm(t_feat_norm - s_feat_norm, dim=1, keepdim=True)
+                
+                # 上采样到256x256
+                diff_up = F.interpolate(diff, size=(IMAGE_SIZE, IMAGE_SIZE), mode='bilinear', align_corners=False)
+                anomaly_maps.append(diff_up)
+            
+            # 多尺度融合
+            anomaly_map = torch.sum(torch.stack(anomaly_maps, dim=0), dim=0).squeeze(1)
+            
+            # 高斯平滑
+            for i in range(anomaly_map.shape[0]):
+                anomaly_map[i] = torch.tensor(gaussian_filter(anomaly_map[i].cpu().numpy(), sigma=2)).to(DEVICE)
+            
+            # 归一化
+            anomaly_map = (anomaly_map - anomaly_map.min()) / (anomaly_map.max() - anomaly_map.min() + 1e-8)
+            
+            pred_scores.extend(anomaly_map.max(dim=1)[0].max(dim=1)[0].cpu().numpy())
+            pred_masks.extend(anomaly_map)
+            
+            # 可视化部分结果（每类随机选1张）
+            if len(pred_masks) <= 1:
+                visualize_result(imgs[0], gt_masks[0], anomaly_map[0], 
+                               save_path=f"rgpkd_{img_paths[0].split('/')[-2]}_{img_paths[0].split('/')[-1]}")
+    
+    # 计算指标
+    i_auroc, p_auroc, pro = calculate_metrics(pred_scores, gt_labels, pred_masks, gt_masks)
+    return i_auroc, p_auroc, pro
 
-            anomaly_map, amap_list = cal_anomaly_map(inputs, outputs, img.shape[-1], amap_mode='a')
-            # anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-            ano_map = min_max_norm(anomaly_map)
-            ano_map = cvt2heatmap(ano_map * 255)
-            img = cv2.cvtColor(img.permute(0, 2, 3, 1).cpu().numpy()[0] * 255, cv2.COLOR_BGR2RGB)
-            img = np.uint8(min_max_norm(img) * 255)
-            cv2.imwrite('./nd_results/' + name + '_' + str(_class_) + '_' + str(count) + '_' + 'org.png', img)
-            # plt.imshow(img)
-            # plt.axis('off')
-            # plt.savefig('org.png')
-            # plt.show()
-            ano_map = show_cam_on_image(img, ano_map)
-            cv2.imwrite('./nd_results/' + name + '_' + str(_class_) + '_' + str(count) + '_' + 'ad.png', ano_map)
-            # plt.imshow(ano_map)
-            # plt.axis('off')
-            # plt.savefig('ad.png')
-            # plt.show()
-
-            # gt = gt.cpu().numpy().astype(int)[0][0]*255
-            # cv2.imwrite('./results/'+_class_+'_'+str(count)+'_'+'gt.png', gt)
-
-            # b, c, h, w = inputs[2].shape
-            # t_feat = F.normalize(inputs[2], p=2).view(c, -1).permute(1, 0).cpu().numpy()
-            # s_feat = F.normalize(outputs[2], p=2).view(c, -1).permute(1, 0).cpu().numpy()
-            # c = 1-min_max_norm(cv2.resize(anomaly_map,(h,w))).flatten()
-            # print(c.shape)
-            # t_sne([t_feat, s_feat], c)
-            # assert 1 == 2
-
-            # name = 0
-            # for anomaly_map in amap_list:
-            #    anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-            #    ano_map = min_max_norm(anomaly_map)
-            #    ano_map = cvt2heatmap(ano_map * 255)
-            # ano_map = show_cam_on_image(img, ano_map)
-            # cv2.imwrite(str(name) + '.png', ano_map)
-            # plt.imshow(ano_map)
-            # plt.axis('off')
-            # plt.savefig(str(name) + '.png')
-            # plt.show()
-            #    name+=1
-            # count += 1
-            # if count>40:
-            #    return 0
-            # assert 1==2
-            gt_list_sp.extend(label.cpu().data.numpy())
-            prmax_list_sp.append(np.max(anomaly_map))
-            prmean_list_sp.append(np.sum(anomaly_map))  # np.sum(anomaly_map.ravel().argsort()[-1:][::-1]))
-
-        gt_list_sp = np.array(gt_list_sp)
-        indx1 = gt_list_sp == _class_
-        indx2 = gt_list_sp != _class_
-        gt_list_sp[indx1] = 0
-        gt_list_sp[indx2] = 1
-
-        ano_score = (prmean_list_sp - np.min(prmean_list_sp)) / (np.max(prmean_list_sp) - np.min(prmean_list_sp))
-        vis_data = {}
-        vis_data['Anomaly Score'] = ano_score
-        vis_data['Ground Truth'] = np.array(gt_list_sp)
-        # print(type(vis_data))
-        # np.save('vis.npy',vis_data)
-        with open('vis.pkl', 'wb') as f:
-            pickle.dump(vis_data, f, pickle.HIGHEST_PROTOCOL)
-
-
-def compute_pro(masks: ndarray, amaps: ndarray, num_th: int = 200) -> None:
-    """Compute the area under the curve of per-region overlaping (PRO) and 0 to 0.3 FPR
-    Args:
-        category (str): Category of product
-        masks (ndarray): All binary masks in test. masks.shape -> (num_test_data, h, w)
-        amaps (ndarray): All anomaly maps in test. amaps.shape -> (num_test_data, h, w)
-        num_th (int, optional): Number of thresholds
-    """
-
-    assert isinstance(amaps, ndarray), "type(amaps) must be ndarray"
-    assert isinstance(masks, ndarray), "type(masks) must be ndarray"
-    assert amaps.ndim == 3, "amaps.ndim must be 3 (num_test_data, h, w)"
-    assert masks.ndim == 3, "masks.ndim must be 3 (num_test_data, h, w)"
-    assert amaps.shape == masks.shape, "amaps.shape and masks.shape must be same"
-    assert set(masks.flatten()) == {0, 1}, "set(masks.flatten()) must be {0, 1}"
-    assert isinstance(num_th, int), "type(num_th) must be int"
-
-    df = pd.DataFrame([], columns=["pro", "fpr", "threshold"])
-    binary_amaps = np.zeros_like(amaps, dtype=np.bool_)
-
-    min_th = amaps.min()
-    max_th = amaps.max()
-    delta = (max_th - min_th) / num_th
-
-    for th in np.arange(min_th, max_th, delta):
-        binary_amaps[amaps <= th] = 0  # 从预测的map的最小值 一直到最大值
-        binary_amaps[amaps > th] = 1
-
-        pros = []
-        for binary_amap, mask in zip(binary_amaps, masks):
-            for region in measure.regionprops(measure.label(mask)):
-                axes0_ids = region.coords[:, 0]  ## mask 的真值区域
-                axes1_ids = region.coords[:, 1]
-                tp_pixels = binary_amap[axes0_ids, axes1_ids].sum()
-                pros.append(tp_pixels / region.area)  # 为 binarymap 与 mask交集所占mask区域的比例
-
-        inverse_masks = 1 - masks
-        fp_pixels = np.logical_and(inverse_masks, binary_amaps).sum()
-        fpr = fp_pixels / inverse_masks.sum()
-
-        df = df._append({"pro": mean(pros), "fpr": fpr, "threshold": th}, ignore_index=True)
-
-    # Normalize FPR from 0 ~ 1 to 0 ~ 0.3
-    df = df[df["fpr"] < 0.3]
-    df["fpr"] = df["fpr"] / df["fpr"].max()
-
-    pro_auc = auc(df["fpr"], df["pro"])
-    return pro_auc
-
-
-def detection(encoder, bn, decoder, dataloader, device, _class_):
-    # _, t_bn = resnet50(pretrained=True)
-    bn.load_state_dict(bn.state_dict())
-    bn.eval()
-    # t_bn.to(device)
-    # t_bn.load_state_dict(bn.state_dict())
-    decoder.eval()
-    gt_list_sp = []
-    prmax_list_sp = []
-    prmean_list_sp = []
-    with torch.no_grad():
-        for img, label in dataloader:
-
-            img = img.to(device)
-            if img.shape[1] == 1:
-                img = img.repeat(1, 3, 1, 1)
-            label = label.to(device)
-            inputs = encoder(img)
-            outputs = decoder(bn(inputs))
-            anomaly_map, _ = cal_anomaly_map(inputs, outputs, img.shape[-1], 'acc')
-            anomaly_map = gaussian_filter(anomaly_map, sigma=4)
-
-            gt_list_sp.extend(label.cpu().data.numpy())
-            prmax_list_sp.append(np.max(anomaly_map))
-            prmean_list_sp.append(np.sum(anomaly_map))  # np.sum(anomaly_map.ravel().argsort()[-1:][::-1]))
-
-        gt_list_sp = np.array(gt_list_sp)
-        indx1 = gt_list_sp == _class_
-        indx2 = gt_list_sp != _class_
-        gt_list_sp[indx1] = 0
-        gt_list_sp[indx2] = 1
-
-        auroc_sp_max = round(roc_auc_score(gt_list_sp, prmax_list_sp), 4)
-        auroc_sp_mean = round(roc_auc_score(gt_list_sp, prmean_list_sp), 4)
-    return auroc_sp_max, auroc_sp_mean
-
-
-if __name__ == '__main__':
-    item_list = ['carpet', 'bottle', 'hazelnut', 'leather', 'cable', 'capsule', 'grid', 'pill',
-                 'transistor', 'metal_nut', 'screw', 'toothbrush', 'zipper', 'tile', 'wood']
-    for i in item_list:
-        test(i)
+if __name__ == "__main__":
+    # 示例用法
+    root_dir = "path/to/mvtec_ad"  # 替换为实际路径
+    category = "bottle"  # 选择类别
+    
+    print("开始训练RGPKD模型...")
+    model = train_rgpkd(root_dir, category)
+    print("RGPKD训练完成！")
